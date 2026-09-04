@@ -20,7 +20,7 @@ def add_ingestion_metadata(
 
         .withColumn("_source_system",F.lit(source_system))
         
-        .withColumn("_source_file", F.input_file_name())
+        .withColumn("_source_file", F.col("_metadata.file_path"))
         
         .withColumn("_batch_id", F.lit(batch_id))
         
