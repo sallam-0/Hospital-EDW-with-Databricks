@@ -21,6 +21,9 @@ BRONZE_SCHEMA = "bronze"
 
 RAW_VOLUME = "raw_files"
 
+CHECKPOINT_BASE_PATH = f"/Volumes/{CATALOG}/{LANDING_SCHEMA}/{RAW_VOLUME}/_checkpoints"
+SCHEMA_BASE_PATH = f"/Volumes/{CATALOG}/{LANDING_SCHEMA}/{RAW_VOLUME}/_schemas"
+
 
 # Source tables
 TABLE_CONFIG = {

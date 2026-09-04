@@ -16,7 +16,7 @@ def add_ingestion_metadata(
 
     return(
         df
-        .withColumn("_branch", F.lit(branch))
+        .withColumn("_source_branch", F.lit(branch))
 
         .withColumn("_source_system",F.lit(source_system))
         
