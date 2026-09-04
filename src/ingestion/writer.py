@@ -1,3 +1,4 @@
+from pyspark.sql import DataFrame
 from pyspark.sql.streaming import StreamingQuery
 
 
