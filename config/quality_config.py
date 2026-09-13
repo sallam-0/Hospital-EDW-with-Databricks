@@ -1,0 +1,31 @@
+# config/quality_config.py
+
+DQ_CATALOG = "hospital_catalog"
+
+QUALITY_SCHEMA = "quality"
+QUARANTINE_SCHEMA = "quarantine"
+BRONZE_SCHEMA = "bronze"
+SILVER_SCHEMA = "silver"
+
+DQ_RESULTS_TABLE = (
+    f"{DQ_CATALOG}.{QUALITY_SCHEMA}.dq_results"
+)
+
+DQ_RUNS_TABLE = (
+    f"{DQ_CATALOG}.{QUALITY_SCHEMA}.dq_runs"
+)
+
+SEVERITY_CRITICAL = "CRITICAL"
+SEVERITY_HIGH = "HIGH"
+SEVERITY_MEDIUM = "MEDIUM"
+SEVERITY_LOW = "LOW"
+
+CATEGORY_COMPLETENESS = "Completeness"
+CATEGORY_UNIQUENESS = "Uniqueness"
+CATEGORY_VALIDITY = "Validity"
+CATEGORY_REFERENTIAL_INTEGRITY = "Referential Integrity"
+CATEGORY_BUSINESS_RULE = "Business Rules"
+CATEGORY_TYPE_CONFORMITY = "Type Conformity"
+
+STATUS_PASSED = "PASSED"
+STATUS_FAILED = "FAILED"
