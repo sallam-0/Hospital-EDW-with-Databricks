@@ -1,0 +1,52 @@
+# resources/hospital_edw_job.yml
+# Databricks Asset Bundle Job definition for automated end-to-end pipeline execution
+
+resources:
+  jobs:
+    hospital_edw_end_to_end_pipeline:
+      name: "[${bundle.target}] Hospital EDW End-to-End Pipeline"
+
+      schedule:
+        quartz_cron_expression: "0 0 2 * * ?"
+        timezone_id: "UTC"
+        pause_status: PAUSED
+
+      tasks:
+        # ── Step 1: Ingest Bronze from Raw Files ─────────────────────────────
+        - task_key: "01_ingest_bronze"
+          notebook_task:
+            notebook_path: "notebooks/ingestion/ingest_all_sources.ipynb"
+            source: WORKSPACE
+
+        # ── Step 2: Incremental Clean & Silver Upsert ────────────────────────
+        - task_key: "02_process_silver"
+          depends_on:
+            - task_key: "01_ingest_bronze"
+          notebook_task:
+            notebook_path: "notebooks/silver/process_all_silver.ipynb"
+            source: WORKSPACE
+
+        # ── Step 3A: Patient Identity Resolution (Parallel) ──────────────────
+        - task_key: "03A_patient_identity"
+          depends_on:
+            - task_key: "02_process_silver"
+          notebook_task:
+            notebook_path: "notebooks/identity/01_patient_identity_probabilistic_enterprise.ipynb"
+            source: WORKSPACE
+
+        # ── Step 3B: Doctor Identity Resolution (Parallel) ───────────────────
+        - task_key: "03B_doctor_identity"
+          depends_on:
+            - task_key: "02_process_silver"
+          notebook_task:
+            notebook_path: "notebooks/identity/02_doctor_identity_enterprise.ipynb"
+            source: WORKSPACE
+
+        # ── Step 4: Build Conformed Dimensions & Facts (Gold Layer) ──────────
+        - task_key: "04_build_gold"
+          depends_on:
+            - task_key: "03A_patient_identity"
+            - task_key: "03B_doctor_identity"
+          notebook_task:
+            notebook_path: "notebooks/gold/01_build_gold_layer.ipynb"
+            source: WORKSPACE
