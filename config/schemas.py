@@ -90,6 +90,9 @@ DIAGNOSIS_SCHEMA = {
 }
 
 PROCEDURE_SCHEMA = {
+    # Columns exactly as produced by the data generator / source CSV.
+    # nurse_id and helper_id are NOT in scope — the source system does not
+    # capture these fields. They have been removed from the gold schema.
     "procedure_id": "string",
     "encounter_id": "string",
     "admission_id": "string",
@@ -100,7 +103,7 @@ PROCEDURE_SCHEMA = {
     "start_time": "string",
     "end_time": "string",
     "room_no": "string",
-    "notes": "string"
+    "notes": "string",
 }
 
 ADMISSION_SCHEMA = {

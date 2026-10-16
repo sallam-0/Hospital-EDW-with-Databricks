@@ -1,22 +1,38 @@
 # src/gold/dimensions.py
 """
-Gold layer — reference and conformed dimensions  (Phase 1).
+Gold layer — reference and conformed dimensions.
 
 Builds / refreshes:
   1. dim_date           — calendar spine 2015-2035
-  2. dim_department     — hospital departments (from silver.departments)
-  3. dim_medication     — pharmacy drug reference (from silver.medications)
-  4. dim_diagnosis_code — ICD-10 codes (derived from silver.diagnoses)
-  5. dim_payer          — insurance payers (derived from silver.insurance_claims)
+  2. dim_department     — hospital departments          (dept_sk INT surrogate)
+  3. dim_medication     — pharmacy drug reference        (medication_sk INT surrogate)
+  4. dim_diagnosis_code — ICD-10 codes                  (diagnosis_sk INT surrogate)
+  5. dim_payer          — insurance payers               (payer_sk INT surrogate; 0 = SELF-PAY)
 
 dim_patient and dim_doctor are built by the identity-resolution notebooks
 and are NOT re-built here.
+
+Surrogate Key Design
+--------------------
+* dim_date         : date_key  = YYYYMMDD integer (the date itself is the surrogate — standard practice)
+* dim_department   : dept_sk   = dense integer (ROW_NUMBER ordered by dept_id)
+* dim_medication   : medication_sk = dense integer (ROW_NUMBER ordered by medication_id)
+* dim_diagnosis_code: diagnosis_sk = dense integer (ROW_NUMBER ordered by icd10_code)
+* dim_payer        : payer_sk  = dense integer (ROW_NUMBER ordered by payer_name); 0 = SELF-PAY sentinel
 """
 
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.window import Window
 
-from src.gold.writer import overwrite_table, upsert_table, optimize
+from src.gold.writer import overwrite_table, optimize
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sentinel constants  (shared with facts.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+SELF_PAY_NAME = "SELF-PAY"
+SELF_PAY_SK   = 0          # Integer surrogate used as FK in fact_billing
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -34,7 +50,7 @@ def build_dim_date(
 
     Columns
     -------
-    date_key          int      YYYYMMDD surrogate (FK in fact tables)
+    date_key          int      YYYYMMDD — this IS the surrogate (FK in fact tables)
     full_date         date
     day_of_week       int      1 = Sunday … 7 = Saturday (Spark convention)
     day_name          string   'Monday', 'Tuesday', …
@@ -47,7 +63,7 @@ def build_dim_date(
     quarter_label     string   'Q1', 'Q2', …
     year              int
     is_weekend        boolean  Saturday or Sunday
-    fiscal_year       int      Apr–Mar cycle (common MOHP / hospital fiscal year)
+    fiscal_year       int      Apr–Mar cycle (MOHP hospital fiscal year)
     fiscal_quarter    int      1-4 relative to 1-Apr
     """
     dim_tbl = tables["dim_date"]
@@ -83,6 +99,23 @@ def build_dim_date(
                      .when(F.month("full_date").between(7,  9), F.lit(2))
                      .when(F.month("full_date").between(10, 12), F.lit(3))
                      .otherwise(F.lit(4)))
+        .select(
+            "date_key",
+            "full_date",
+            "day_of_week",
+            "day_name",
+            "day_of_month",
+            "day_of_year",
+            "week_of_year",
+            "month_num",
+            "month_name",
+            "quarter",
+            "quarter_label",
+            "year",
+            "is_weekend",
+            "fiscal_year",
+            "fiscal_quarter",
+        )
     )
 
     overwrite_table(spark, dim_date, dim_tbl)
@@ -104,7 +137,8 @@ def build_dim_department(
 
     Columns
     -------
-    dept_id            string  NK (PK in silver)
+    dept_sk            int     Surrogate PK (dense, ordered by dept_id)
+    dept_id            string  Natural Key (source code)
     dept_name          string  standardised name
     source_branches    array   branches that reported this dept
     source_branch_count int
@@ -113,16 +147,16 @@ def build_dim_department(
     dim_tbl    = tables["dim_department"]
     silver_src = silver_tables["departments"]
 
-    # Latest record per dept_id
-    w = Window.partitionBy("dept_id").orderBy(F.col("_ingestion_timestamp").desc())
+    # Latest record per dept_id (SCD-1)
+    w_latest = Window.partitionBy("dept_id").orderBy(F.col("_ingestion_timestamp").desc())
     latest = (
         spark.table(silver_src)
-        .withColumn("_rn", F.row_number().over(w))
+        .withColumn("_rn", F.row_number().over(w_latest))
         .filter(F.col("_rn") == 1)
         .select("dept_id", "dept_name")
     )
 
-    # Branch coverage
+    # Branch coverage aggregation
     branch_agg = (
         spark.table(silver_src)
         .groupBy("dept_id")
@@ -132,11 +166,16 @@ def build_dim_department(
         )
     )
 
+    # Surrogate key: dense integer ordered deterministically by dept_id
+    w_sk = Window.orderBy(F.col("dept_id").asc())
+
     dim = (
         latest
         .join(branch_agg, on="dept_id", how="left")
+        .withColumn("dept_sk", F.row_number().over(w_sk).cast("int"))
         .withColumn("last_updated_at", F.current_timestamp())
         .select(
+            "dept_sk",
             "dept_id",
             "dept_name",
             "source_branches",
@@ -146,7 +185,7 @@ def build_dim_department(
     )
 
     overwrite_table(spark, dim, dim_tbl)
-    optimize(spark, dim_tbl, ["dept_id"])
+    optimize(spark, dim_tbl, ["dept_sk"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,7 +202,8 @@ def build_dim_medication(
 
     Columns
     -------
-    medication_id     string  NK (PK)
+    medication_sk     int     Surrogate PK (dense, ordered by medication_id)
+    medication_id     string  Natural Key (e.g. 'MED-001')
     medication_name   string
     category          string  drug category / ATC class
     dosage_form       string  tablet / capsule / syrup / injection / …
@@ -174,16 +214,19 @@ def build_dim_medication(
     dim_tbl    = tables["dim_medication"]
     silver_src = silver_tables["medications"]
 
-    w = Window.partitionBy("medication_id").orderBy(
+    w_latest = Window.partitionBy("medication_id").orderBy(
         F.col("_ingestion_timestamp").desc()
     )
+    w_sk = Window.orderBy(F.col("medication_id").asc())
 
     dim = (
         spark.table(silver_src)
-        .withColumn("_rn", F.row_number().over(w))
+        .withColumn("_rn", F.row_number().over(w_latest))
         .filter(F.col("_rn") == 1)
+        .withColumn("medication_sk", F.row_number().over(w_sk).cast("int"))
         .withColumn("last_updated_at", F.current_timestamp())
         .select(
+            "medication_sk",
             "medication_id",
             "medication_name",
             "category",
@@ -195,7 +238,7 @@ def build_dim_medication(
     )
 
     overwrite_table(spark, dim, dim_tbl)
-    optimize(spark, dim_tbl, ["medication_id"])
+    optimize(spark, dim_tbl, ["medication_sk"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,7 +257,8 @@ def build_dim_diagnosis_code(
 
     Columns
     -------
-    icd10_code        string  PK (e.g. 'E11.9', 'J06.9')
+    diagnosis_sk      int     Surrogate PK (dense, ordered by icd10_code)
+    icd10_code        string  Natural Key (e.g. 'E11.9', 'J06.9')
     diagnosis_name    string  canonical name (most common across branches)
     icd10_chapter     string  first character of code — ICD-10 chapter letter
     usage_count       long    total occurrences in fact data
@@ -245,12 +289,17 @@ def build_dim_diagnosis_code(
         .select("icd10_code", "diagnosis_name")
     )
 
+    # Surrogate key: dense integer ordered deterministically by icd10_code
+    w_sk = Window.orderBy(F.col("icd10_code").asc())
+
     dim = (
         canonical_name
         .join(code_stats, on="icd10_code", how="left")
+        .withColumn("diagnosis_sk", F.row_number().over(w_sk).cast("int"))
         .withColumn("icd10_chapter", F.upper(F.substring(F.col("icd10_code"), 1, 1)))
         .withColumn("last_updated_at", F.current_timestamp())
         .select(
+            "diagnosis_sk",
             "icd10_code",
             "diagnosis_name",
             "icd10_chapter",
@@ -260,16 +309,12 @@ def build_dim_diagnosis_code(
     )
 
     overwrite_table(spark, dim, dim_tbl)
-    optimize(spark, dim_tbl, ["icd10_code"])
+    optimize(spark, dim_tbl, ["diagnosis_sk"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. dim_payer — Insurance Payer Reference
 # ─────────────────────────────────────────────────────────────────────────────
-
-SELF_PAY_NAME = "SELF-PAY"
-SELF_PAY_KEY  = "0000000000000000000000000000000000000000000000000000000000000000"
-
 
 def build_dim_payer(
     spark: SparkSession, tables: dict, silver_tables: dict
@@ -277,48 +322,67 @@ def build_dim_payer(
     """
     Build an insurance payer reference table from silver.insurance_claims.
 
-    Assigns a SHA-256 surrogate key so the FK in fact_billing is stable
-    even without a formal payer master file in the source.
+    Uses ALL claim records (regardless of claim_status) for payer discovery,
+    so that payers are identified even if their claims are DENIED or PENDING.
 
     A special sentinel row is always included:
-      payer_key = SELF_PAY_KEY  →  payer_name = "SELF-PAY"
-    This covers invoices with no insurance claim (cash / self-pay patients)
-    so that fact_billing → dim_payer referential integrity holds for all rows.
+      payer_sk = 0  →  payer_name = "SELF-PAY"
+    This covers invoices with no insurance claim (cash / self-pay patients).
 
     Columns
     -------
-    payer_key         string  SHA-256 surrogate PK (or SELF_PAY_KEY sentinel)
+    payer_sk          int     Surrogate PK (dense int; 0 = SELF-PAY sentinel)
     payer_name        string  canonical payer name
-    total_claims      long    claim records for this payer (0 for SELF-PAY)
+    total_claims      long    total claim records for this payer (0 for SELF-PAY)
+    approved_claims   long    claims with APPROVED or SETTLED status
     last_updated_at   timestamp
     """
     dim_tbl    = tables["dim_payer"]
     silver_src = silver_tables["insurance_claims"]
 
-    # Rows from real insurance payers
+    # Use ALL claims (not just APPROVED/SETTLED) so we capture every known payer
     real_payers = (
         spark.table(silver_src)
         .filter(
             F.col("payer_name").isNotNull() &
             (F.trim(F.col("payer_name")) != "")
         )
-        .groupBy("payer_name")
-        .agg(F.count("*").alias("total_claims"))
-        .withColumn("payer_key", F.sha2(F.lower(F.trim(F.col("payer_name"))), 256))
-        .withColumn("last_updated_at", F.current_timestamp())
-        .select("payer_key", "payer_name", "total_claims", "last_updated_at")
+        .groupBy(F.lower(F.trim(F.col("payer_name"))).alias("_payer_name_lower"))
+        .agg(
+            # canonical name = most frequent casing
+            F.first(F.col("payer_name"), ignorenulls=True).alias("payer_name"),
+            F.count("*").alias("total_claims"),
+            F.sum(
+                F.when(
+                    F.upper(F.col("claim_status")).isin(["APPROVED", "SETTLED"]),
+                    F.lit(1)
+                ).otherwise(F.lit(0))
+            ).alias("approved_claims"),
+        )
+        .drop("_payer_name_lower")
     )
 
-    # Sentinel row for self-pay / uninsured invoices
-    sentinel = spark.createDataFrame(
-        [(SELF_PAY_KEY, SELF_PAY_NAME, 0)],
-        ["payer_key", "payer_name", "total_claims"],
-    ).withColumn("last_updated_at", F.current_timestamp())
+    # Surrogate key: dense integer ordered by payer_name; 1-based (0 reserved for sentinel)
+    w_sk = Window.orderBy(F.col("payer_name").asc())
+    real_payers = real_payers.withColumn(
+        "payer_sk", F.row_number().over(w_sk).cast("int")
+    )
 
-    dim = real_payers.unionByName(sentinel)
+    # Sentinel row for self-pay / uninsured invoices (payer_sk = 0)
+    sentinel = spark.createDataFrame(
+        [(SELF_PAY_SK, SELF_PAY_NAME, 0, 0)],
+        ["payer_sk", "payer_name", "total_claims", "approved_claims"],
+    )
+
+    dim = (
+        real_payers
+        .select("payer_sk", "payer_name", "total_claims", "approved_claims")
+        .unionByName(sentinel)
+        .withColumn("last_updated_at", F.current_timestamp())
+    )
 
     overwrite_table(spark, dim, dim_tbl)
-    optimize(spark, dim_tbl, ["payer_key"])
+    optimize(spark, dim_tbl, ["payer_sk"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -332,7 +396,7 @@ def build_all_dimensions(
     date_start: str = "2015-01-01",
     date_end:   str = "2035-12-31",
 ) -> None:
-    """Build (or refresh) all Phase 1 gold reference dimensions."""
+    """Build (or refresh) all gold reference dimensions."""
     print("=" * 65)
     print("  GOLD LAYER — Building reference dimensions")
     print("=" * 65)
