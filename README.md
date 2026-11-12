@@ -1,4 +1,4 @@
-# 🏥 Hospital Enterprise Data Warehouse (EDW)
+# Hospital Enterprise Data Warehouse (EDW)
 ### *A Production-Grade, End-to-End Healthcare Analytics Platform on Databricks*
 
 ---
@@ -7,7 +7,7 @@
 
 ---
 
-## 📋 Table of Contents
+## Table of Contents
 
 1. [Project Overview](#1-project-overview)
 2. [Architecture](#2-architecture)
@@ -37,72 +37,32 @@ The **Hospital EDW** is a complete data engineering reference project simulating
 | **Platform** | Databricks Lakehouse (Unity Catalog) |
 | **Architecture** | Medallion — Bronze → Silver → Gold |
 | **Source Systems** | EMR, Laboratory, Pharmacy, Billing |
-| **Tables Ingested** | 15 source tables × 3 branches = 45 raw files |
+| **Tables Ingested** | 15 source tables × 3 branches = 45 source feeds, landed into 15 Bronze tables |
 | **Gold Tables** | 5 conformed dimensions + 2 enterprise identity dims + 8 fact tables |
 | **Identity Resolution** | Fellegi-Sunter probabilistic matching with graph-based clustering |
 | **Governance** | PII tags, column-level masking policies, RBAC via Unity Catalog |
 | **Orchestration** | Databricks Workflows (DAG) + Databricks Asset Bundles (DABs) |
+| **Data Quality** | 107 declarative rules across 15 tables, with quarantine and run logging |
 | **Analytics** | 6-page Power BI dashboard |
 
 ---
 
 ## 2. Architecture
 
-The pipeline follows the **Medallion Architecture**, with an enterprise-grade **Probabilistic Identity Resolution** stage sitting between Silver and Gold.
+The pipeline follows the **Medallion Architecture**, with a dedicated **Data Quality Gate** between Bronze and Silver and an enterprise-grade **Probabilistic Identity Resolution** stage between Silver and Gold.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    RAW CSV FILES IN VOLUMES                         │
-│   /Volumes/hospital_catalog/raw_landing/raw_files/{branch}/...      │
-└─────────────────────────────────┬───────────────────────────────────┘
-                                  │  Auto Loader / Batch Ingest
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                          BRONZE LAYER                               │
-│  Append-only ingestion · Schema enforcement · Audit metadata        │
-│  hospital_catalog.bronze.*  (15 tables × 3 branches)               │
-└───────────────────┬─────────────────────────────────────────────────┘
-                    │  High-watermark incremental read
-                    ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                     DATA QUALITY GATE                               │
-│  200+ rules · Completeness · Uniqueness · Validity · RI checks      │
-│  CRITICAL failures → Quarantine  |  MEDIUM → Pass-through           │
-└───────────────────┬─────────────────────────────────────────────────┘
-                    │  Delta MERGE (upsert)
-                    ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                          SILVER LAYER                               │
-│  Cleaned · Standardized · Deduplicated · hospital_catalog.silver.*  │
-└──────────────────┬────────────────────────────┬─────────────────────┘
-                   │                            │
-                   ▼                            ▼
-      ┌────────────────────┐        ┌──────────────────────┐
-      │  PATIENT IDENTITY  │        │  DOCTOR IDENTITY     │
-      │  Fellegi-Sunter    │        │  Fellegi-Sunter      │
-      │  Probabilistic     │        │  Probabilistic       │
-      │  Matching +        │        │  Matching            │
-      │  Graph Clustering  │        │                      │
-      │  EP-<uuid> IDs     │        │  ED-<uuid> IDs       │
-      └──────────┬─────────┘        └──────────┬───────────┘
-                 └──────────────┬───────────────┘
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                           GOLD LAYER                                │
-│  Star Schema · Conformed Dimensions + 8 Fact Tables                 │
-│  hospital_catalog.gold.*                                            │
-└─────────────────────────────────┬───────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│              BI & ANALYTICS CONSUMPTION                             │
-│  Power BI · Databricks SQL Dashboards · Clinical Analytics          │
-└─────────────────────────────────────────────────────────────────────┘
-```
+![Hospital EDW Medallion Data Flow](docs/Architecture.jpg)
 
+| Stage | Description | Location |
+|---|---|---|
+| **01 / Raw Landing** | CSV extracts from EMR (7 tables), Laboratory (2), Pharmacy (3), and Billing (3) for each branch | `/Volumes/hospital_catalog/landing/raw_files/{branch}/{source_system}/{table}/` |
+| **02 / Bronze** | Append-only Delta tables loaded incrementally with Auto Loader, enriched with audit metadata | `hospital_catalog.bronze.*` (15 tables) |
+| **03 / Quality** | 107 declarative rules; failed rows are written to quarantine and every run is logged for steward audit | `hospital_catalog.quality.*`, `hospital_catalog.quarantine.*` |
+| **04 / Silver + Identity** | Cleaned, standardized, and deduplicated tables upserted with Delta MERGE; patients and doctors resolved to enterprise IDs | `hospital_catalog.silver.*` (15 tables + identity registry) |
+| **05 / Gold + Serving** | Star schema with 7 dimensions and 8 fact tables, consumed by a read-only Power BI semantic model | `hospital_catalog.gold.*` |
 ### ETL Job DAG (Databricks Workflows)
 
-The pipeline is orchestrated as a 5-task Databricks Workflow. Tasks 04A and 04B run **in parallel** to reduce total runtime:
+The pipeline is orchestrated as a 6-task Databricks Workflow. Tasks 04A and 04B run **in parallel** to reduce total runtime:
 
 ![ETL Job DAG](docs/ETL_JOB.png)
 
@@ -150,7 +110,7 @@ The generator deliberately creates **dirty duplicates** to simulate real-world M
   - Different date formats (`2026-08-20` vs `20/08/2026`)
   - Different gender encodings (`M` vs `Male` vs `male`)
 - **~10% of doctors** hold credentials across multiple branches
-- Ground truth identity maps (`enterprise_patient_map.csv`, `enterprise_staff_map.csv`) are provided for validation
+- Ground truth identity maps (`enterprise_patient_map_<batch_date>.csv`, `enterprise_staff_map_<batch_date>.csv`) are provided for validation
 
 ### Generating Data
 
@@ -170,6 +130,9 @@ python generate_hospital_data.py --patients 20000 --seed 42 --outdir output
 | `--outdir` | `output` | Output directory for CSVs |
 | `--start-date` | 2019-01-01 | Simulation start date |
 | `--end-date` | 2026-08-29 | Simulation end date |
+| `--batch-date` | Today | Batch date appended to output file names |
+
+Output files are written in the same hierarchy the ingestion layer expects: `output/{branch}/{source_system}/{table}/{table}_{batch_date}.csv`.
 
 ---
 
@@ -177,16 +140,16 @@ python generate_hospital_data.py --patients 20000 --seed 42 --outdir output
 
 ### 4.1 Bronze — Raw Ingestion
 
-The Bronze layer is an **append-only** landing zone. Every source file is ingested with full fidelity — no transformations, no filtering.
+The Bronze layer is an **append-only** landing zone. Every source file is ingested incrementally with **Auto Loader** (`cloudFiles`, `availableNow` trigger) at full fidelity — no transformations, no filtering. Rows from all three branches land in the same Bronze table and are distinguished by the `_source_branch` audit column.
 
 **Key components:**
 
 | Component | File | Responsibility |
 |---|---|---|
 | Configuration | [`config/ingestion_config.py`](config/ingestion_config.py) | Catalog paths, branch list, domain → table mapping |
-| Schema Contract | [`config/schemas.py`](config/schemas.py) | Explicit PySpark `StructType` for all 15 tables |
-| File Reader | [`src/ingestion/reader.py`](src/ingestion/reader.py) | CSV reads with schema enforcement |
-| Delta Writer | [`src/ingestion/writer.py`](src/ingestion/writer.py) | Append to Bronze Delta tables |
+| Schema Contract | [`config/schemas.py`](config/schemas.py) | Explicit PySpark `StructType` definitions for all 15 tables |
+| File Reader | [`src/ingestion/reader.py`](src/ingestion/reader.py) | Incremental CSV reads with Auto Loader and schema tracking |
+| Delta Writer | [`src/ingestion/writer.py`](src/ingestion/writer.py) | Streaming append to Bronze Delta tables with checkpointing |
 | Metadata Enricher | [`src/ingestion/metadata.py`](src/ingestion/metadata.py) | Adds audit columns |
 | Pipeline Runner | [`src/ingestion/pipeline.py`](src/ingestion/pipeline.py) | Orchestrates single-table ingestion |
 | Notebook | [`notebooks/ingestion/ingest_all_sources.ipynb`](notebooks/ingestion/ingest_all_sources.ipynb) | Loops all branches × tables |
@@ -323,18 +286,20 @@ The Gold layer implements a clean **Star Schema** optimized for BI consumption. 
 
 ## 5. Data Quality Framework
 
-A dedicated DQ layer validates Bronze data **before** it can enter Silver. The framework runs 200+ declarative rules across all 15 source tables.
+A dedicated DQ layer validates Bronze data **before** it can enter Silver. The framework runs **107 declarative rules** across all 15 source tables.
 
 **DQ Rule Categories:**
 
-| Category | Description | Example Rule |
-|---|---|---|
-| **Completeness** | Required fields must not be NULL or blank | `patient_id NOT NULL` (CRITICAL) |
-| **Uniqueness** | Business keys must be unique per branch | `(branch, patient_id)` is unique (CRITICAL) |
-| **Validity** | Values must conform to allowed sets, formats, and ranges | `gender IN ('M','F','O','male','female')` |
-| **Type Conformity** | Date and numeric fields must parse correctly | `date_of_birth` parseable as date |
-| **Referential Integrity** | Foreign keys must reference valid parents | `encounter.patient_id` exists in `patients` |
-| **Business Rules** | Domain-specific constraints | `discharge_date >= admission_date` |
+| Category | Description | Example Rule | Rules |
+|---|---|---|---|
+| **Completeness** | Required fields must not be NULL or blank | `patient_id NOT NULL` (CRITICAL) | 44 |
+| **Uniqueness** | Business keys must be unique per branch | `(branch, patient_id)` is unique (CRITICAL) | 15 |
+| **Validity** | Values must conform to allowed sets, formats, and ranges | `gender IN ('M','F','O','male','female')` | 18 |
+| **Type Conformity** | Date and numeric fields must parse correctly | `date_of_birth` parseable as date | 30 |
+| **Referential Integrity** | Foreign keys must reference valid parents | `encounter.patient_id` exists in `patients` | Reserved |
+| **Business Rules** | Domain-specific constraints | `discharge_date >= admission_date` | Reserved |
+
+> Referential Integrity and Business Rules are defined as categories in [`config/quality_config.py`](config/quality_config.py) and are reserved for future rule sets.
 
 **Severity Levels:**
 
@@ -356,7 +321,7 @@ A dedicated DQ layer validates Bronze data **before** it can enter Silver. The f
 
 | File | Description |
 |---|---|
-| [`src/quality/rules.py`](src/quality/rules.py) | 200+ declarative rule definitions for all 15 tables |
+| [`src/quality/rules.py`](src/quality/rules.py) | 107 declarative rule definitions for all 15 tables |
 | [`src/quality/engine.py`](src/quality/engine.py) | Rule evaluation engine |
 | [`src/quality/checks.py`](src/quality/checks.py) | Individual check implementations (not_null, unique, allowed_values, etc.) |
 | [`src/quality/quarantine.py`](src/quality/quarantine.py) | Quarantine writer |
@@ -379,7 +344,7 @@ Every column across Silver and Gold is evaluated and tagged with a structured ta
 
 | Tag Name | Example Values | Purpose |
 |---|---|---|
-| `pii` | `true` | Marks column as containing Personal Identifiable Information |
+| `pii` | `true` | Marks column as containing Personally Identifiable Information |
 | `phi` | `true` | Marks Protected Health Information (HIPAA-relevant) |
 | `data_type` | `direct_identifier`, `quasi_identifier`, `pseudonymized_key`, `monetary_amount`, `clinical_observation` | Classifies the nature of the data |
 | `info_type` | `patient_name`, `lab_result_numeric`, `encounter_timestamp`, `bed_number` | Semantic label for the column's content |
@@ -424,9 +389,11 @@ The governance notebooks automatically apply **column masking policies** to any 
 
 ### Method 1: Databricks Workflows UI
 
-Navigate to **Workflows → Create Job** and configure tasks per the DAG. Set a **daily schedule**: `0 0 2 * * ?` (02:00 UTC)
+Navigate to **Workflows → Create Job** and configure tasks per the DAG. Set a **daily schedule** with the Quartz cron expression `0 0 2 * * ?` (02:00 UTC).
 
 ### Method 2: Databricks Asset Bundles (Recommended)
+
+> The current [`databricks.yml`](databricks.yml) defines only the `dev` target. Add a `resources.jobs.hospital_edw_pipeline` definition (mirroring the DAG above) before running the commands below.
 
 ```bash
 # Deploy to dev workspace
@@ -440,7 +407,7 @@ databricks bundle run hospital_edw_pipeline
 
 | Layer | Mechanism | State Management |
 |---|---|---|
-| **Bronze** | Batch ingest by file | `_ingestion_timestamp` added per batch |
+| **Bronze** | Auto Loader (`availableNow` trigger) | Checkpoints under `/Volumes/hospital_catalog/landing/raw_files/_checkpoints` track processed files |
 | **Silver** | High-watermark read + Delta MERGE | `SELECT MAX(_ingestion_timestamp) FROM silver.<table>` |
 | **Identity** | Incremental match & registry | Existing `EP-`/`ED-` IDs preserved; new links resolved |
 | **Gold** | Reference overwrite + Fact MERGE | Reference dims refreshed; facts merged on natural keys |
@@ -470,66 +437,48 @@ The Gold star schema is designed for direct consumption by BI tools. All fact ta
 
 A 6-page **Power BI** dashboard delivers analytical insights across all operational domains. All pages share common **Year** and **Department/Specialty** slicers for cross-filtering.
 
-### Page 1 — Executive Overview
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>1. Executive Overview</strong><br>
+      <a href="docs/Dashboard/Executive_Overview.png"><img src="docs/Dashboard/Executive_Overview.png" alt="Executive Overview Dashboard" width="100%"></a><br>
+      <sub>Total Revenue · Collection Rate · Total Admissions · Avg Length of Stay · No-Show Rate</sub>
+    </td>
+    <td width="50%" valign="top">
+      <strong>2. Admissions &amp; Capacity</strong><br>
+      <a href="docs/Dashboard/Admission_Capacity.png"><img src="docs/Dashboard/Admission_Capacity.png" alt="Admissions and Capacity Dashboard" width="100%"></a><br>
+      <sub>Total Admissions · Emergency Admissions · Avg Length of Stay · Unique Patients · Total Encounters</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>3. Appointments</strong><br>
+      <a href="docs/Dashboard/Appointments.png"><img src="docs/Dashboard/Appointments.png" alt="Appointments Dashboard" width="100%"></a><br>
+      <sub>Total Appointments · Completed · No-Show Rate · Cancellation Rate · Rescheduled</sub>
+    </td>
+    <td width="50%" valign="top">
+      <strong>4. Revenue &amp; Billing</strong><br>
+      <a href="docs/Dashboard/Revenue&amp;Billing.png"><img src="docs/Dashboard/Revenue&amp;Billing.png" alt="Revenue and Billing Dashboard" width="100%"></a><br>
+      <sub>Net Revenue · Gross Billed · Insurance Covered · Collection Rate · Outstanding Balance</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>5. Pharmacy &amp; Prescriptions</strong><br>
+      <a href="docs/Dashboard/Pharmacy&amp;Prescription.png"><img src="docs/Dashboard/Pharmacy&amp;Prescription.png" alt="Pharmacy and Prescriptions Dashboard" width="100%"></a><br>
+      <sub>Pharmacy Revenue · Total Prescriptions · Dispenses · Avg Rx Duration (days) · Items Dispensed</sub>
+    </td>
+    <td width="50%" valign="top">
+      <strong>6. Clinical &amp; Diagnostics</strong><br>
+      <a href="docs/Dashboard/Clinical&amp;Diagnostics.png"><img src="docs/Dashboard/Clinical&amp;Diagnostics.png" alt="Clinical and Diagnostics Dashboard" width="100%"></a><br>
+      <sub>Total Encounters · Lab Tests · Surgeries · Avg Surgery Duration (min) · Avg Diagnoses / Encounter</sub>
+    </td>
+  </tr>
+</table>
 
-*Hospital-wide command center KPI summary.*
-
-![Executive Overview Dashboard](docs/Dashboard/Executive_Overview.png)
-
-**KPIs:** Total Revenue · Collection Rate · Total Admissions · Avg Length of Stay · No-Show Rate
-
----
-
-### Page 2 — Admissions & Capacity
-
-*Inpatient flow and ward utilization analysis.*
-
-![Admissions & Capacity Dashboard](docs/Dashboard/Admission_Capacity.png)
-
-**KPIs:** Total Admissions · Emergency Admissions · Avg Length of Stay · Unique Patients · Total Encounters
-
----
-
-### Page 3 — Appointments
-
-*Outpatient scheduling efficiency and no-show analytics.*
-
-![Appointments Dashboard](docs/Dashboard/Appointments.png)
-
-**KPIs:** Total Appointments · Completed · No-Show Rate · Cancellation Rate · Rescheduled
-
----
-
-### Page 4 — Revenue & Billing
-
-*Financial performance across payers, branches, and payment methods.*
-
-![Revenue & Billing Dashboard](docs/Dashboard/Revenue&Billing.png)
-
-**KPIs:** Net Revenue · Gross Billed · Insurance Covered · Collection Rate · Outstanding Balance
-
----
-
-### Page 5 — Pharmacy & Prescriptions
-
-*Drug utilization, dispensing patterns, and pharmacy revenue.*
-
-![Pharmacy & Prescriptions Dashboard](docs/Dashboard/Pharmacy&Prescription.png)
-
-**KPIs:** Pharmacy Revenue · Total Prescriptions · Dispenses · Avg Rx Duration (days) · Items Dispensed
+> Click any screenshot to open it at full resolution.
 
 ---
-
-### Page 6 — Clinical & Diagnostics
-
-*Encounter patterns, top diagnoses, surgical procedures, and lab test volume.*
-
-![Clinical & Diagnostics Dashboard](docs/Dashboard/Clinical&Diagnostics.png)
-
-**KPIs:** Total Encounters · Lab Tests · Surgeries · Avg Surgery Duration (min) · Avg Diagnoses / Encounter
-
----
-
 ## 10. Repository Structure
 
 ```
@@ -569,6 +518,7 @@ hospital_edw/
 +-- docs/                             # Architecture diagrams & screenshots
 |   +-- PIPELINE_ARCHITECTURE_AND_AUTOMATION.md
 |   +-- data_quality.md
+|   +-- Architecture.jpg
 |   +-- Dimensional_modelling.png
 |   +-- ETL_JOB.png
 |   +-- Tags.png
@@ -631,9 +581,9 @@ python generate_hospital_data.py --patients 5000 --seed 42 --outdir output
 
 Upload CSVs to your Databricks Volume:
 ```
-/Volumes/hospital_catalog/landing/raw_files/cairo/
-/Volumes/hospital_catalog/landing/raw_files/giza/
-/Volumes/hospital_catalog/landing/raw_files/alexandria/
+/Volumes/hospital_catalog/landing/raw_files/cairo/{source_system}/{table}/
+/Volumes/hospital_catalog/landing/raw_files/giza/{source_system}/{table}/
+/Volumes/hospital_catalog/landing/raw_files/alexandria/{source_system}/{table}/
 ```
 
 ### 4. Deploy & Run
